@@ -1,10 +1,71 @@
 import React, { useState } from "react";
+import JSZip from "jszip";
+
+function parseTimestamp(dateStr, timeStr) {
+  const [day, month, year] = dateStr.split("/").map(Number);
+  let [hours, minutes] = [0, 0];
+  const hasAmPm = /am|pm/i.test(timeStr);
+
+  if (hasAmPm) {
+    const normalized = timeStr.trim().toLowerCase();
+    const ampm = normalized.slice(-2);
+    const [h, m] = normalized.replace(/am|pm/g, "").trim().split(":").map(Number);
+    hours = h;
+    minutes = m;
+    if (ampm === "pm" && hours < 12) hours += 12;
+    if (ampm === "am" && hours === 12) hours = 0;
+  } else {
+    [hours, minutes] = timeStr.split(":").map(Number);
+  }
+
+  return new Date(year, month - 1, day, hours, minutes).toISOString();
+}
+
+async function parseZipLocally(file) {
+  const zip = await JSZip.loadAsync(file);
+  const txtEntryName = Object.keys(zip.files).find((name) => name.toLowerCase().endsWith(".txt"));
+  if (!txtEntryName) {
+    return { messages: [], error: "No .txt chat file found in ZIP." };
+  }
+
+  const chatText = await zip.files[txtEntryName].async("string");
+  const headerRe =
+    /^(\d{1,2}\/\d{1,2}\/\d{4}),\s(\d{1,2}:\d{2}(?:\s?(?:am|pm))?)\s[-–]\s([^:]+?):\s(.*)$/i;
+  const lines = chatText.replace(/\uFEFF/g, "").split(/\r?\n/);
+  const messages = [];
+  let last = null;
+
+  for (const raw of lines) {
+    if (!raw) continue;
+    const match = raw.match(headerRe);
+    if (match) {
+      const [, date, time, sender, message] = match;
+      const text = message || "";
+      if (/^Messages and calls are end-to-end encrypted/i.test(text)) continue;
+      const msg = {
+        timestamp: parseTimestamp(date, time),
+        sender: sender.trim(),
+        message: text,
+      };
+      messages.push(msg);
+      last = msg;
+      continue;
+    }
+
+    if (last) {
+      last.message = `${last.message ? `${last.message}\n` : ""}${raw}`;
+    }
+  }
+
+  return { messages };
+}
 
 export default function Upload() {
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [messages, setMessages] = useState([]);
   const [name, setName] = useState("");
+  const [status, setStatus] = useState("");
 
   const handleUpload = async () => {
     if (!file) {
@@ -13,30 +74,74 @@ export default function Upload() {
     }
 
     const formData = new FormData();
-    formData.append("file", file);
+    // n8n workflows often expect binary data under either "data" or "file".
+    // Sending both avoids binary-property mismatches in downstream nodes.
+    formData.append("data", file, file.name);
+    formData.append("file", file, file.name);
+    formData.append("name", name.trim());
+    formData.append("username", name.trim());
 
     setLoading(true);
+    setStatus("");
     try {
       const res = await fetch("http://localhost:5678/webhook/zipfile", {
         method: "POST",
         body: formData,
       });
 
-      if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+      const contentType = res.headers.get("content-type") || "";
+      const rawBody = await res.text();
+      let payload = rawBody;
+      if (contentType.includes("application/json") && rawBody.trim() !== "") {
+        try {
+          payload = JSON.parse(rawBody);
+        } catch (_parseErr) {
+          // Some webhook flows incorrectly set JSON content-type for plain text bodies.
+          // Keep payload as text instead of failing on client-side parsing.
+          payload = rawBody;
+        }
+      }
 
-      const data = await res.json();
-      console.log("JSON from n8n:", data);
+      if (!res.ok) {
+        const details =
+          typeof payload === "string"
+            ? payload.slice(0, 200)
+            : JSON.stringify(payload).slice(0, 200);
+        throw new Error(`HTTP ${res.status}: ${details || "Upload failed"}`);
+      }
+
+      const data =
+        payload && (Array.isArray(payload) || typeof payload === "object") ? payload : {};
+      console.log("Response from n8n:", payload);
 
       if (Array.isArray(data) && data[0]?.messages) {
         setMessages(data[0].messages);
+        setStatus(`Loaded ${data[0].messages.length} messages.`);
       } else if (data.messages) {
         setMessages(data.messages);
+        setStatus(`Loaded ${data.messages.length} messages.`);
       } else {
-        setMessages([]);
+        const fallback = await parseZipLocally(file);
+        if (fallback.messages.length > 0) {
+          setMessages(fallback.messages);
+          setStatus(
+            `Webhook returned empty response, loaded ${fallback.messages.length} messages via local ZIP parsing.`
+          );
+        } else if (rawBody.trim() === "") {
+          setMessages([]);
+          setStatus(
+            fallback.error ||
+              "Upload succeeded, but webhook returned an empty response body."
+          );
+        } else {
+          setMessages([]);
+          setStatus(`Upload succeeded, but no message list found in response: ${rawBody.slice(0, 160)}`);
+        }
       }
     } catch (err) {
       console.error("Upload failed:", err);
-      alert("Upload failed — check console.");
+      setStatus(`Upload failed: ${err.message}`);
+      alert(`Upload failed: ${err.message}`);
     }
     setLoading(false);
   };
@@ -76,6 +181,7 @@ export default function Upload() {
         >
           {loading ? "Uploading..." : "Upload"}
         </button>
+        {status && <p className="mt-3 text-sm text-gray-700">{status}</p>}
       </div>
 
       {/* Chat Section */}
